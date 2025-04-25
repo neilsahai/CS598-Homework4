@@ -1,0 +1,131 @@
+--------------------------preprocessing.py---------------------------------------
+
+#!/usr/bin/env python3
+
+from pyspark.sql import SparkSession, Row
+import shutil
+import os
+
+def parse_line(line):
+    try:
+        # Split off the “searchTerm:” prefix
+        _, rest = line.split(":", 1)
+        # Separate the term from the URL-click list
+        term, urls_str = rest.strip().split(",", 1)
+        term = term.strip()
+        # For each url:click pair, yield a Row
+        for pair in urls_str.strip().split("~"):
+            if not pair:
+                continue
+            url, click_str = pair.split(":")
+            yield Row(term=term,
+                      url=url.strip(),
+                      clicks=int(click_str))
+    except Exception as e:
+        
+        return
+
+if __name__ == "__main__":
+    # 1. Initialize Spark
+    spark = SparkSession.builder \
+        .appName("PreprocessSearchLogs") \
+        .getOrCreate()
+    sc = spark.sparkContext
+
+    # 2. Read the raw log file
+    lines = sc.textFile("searchLog.csv")
+
+    # 3. Parse into (term, url, clicks) records
+    records_rdd = lines.flatMap(parse_line)
+
+    # 4. Convert to DataFrame
+    df = spark.createDataFrame(records_rdd)
+
+    # 5. Remove any existing output directory
+    out_dir = "processed_data"
+    if os.path.exists(out_dir):
+        shutil.rmtree(out_dir)
+
+    # 6. Write out JSON files (one record per line)
+    df.write.json(out_dir)
+
+    # 7. Stop Spark
+    spark.stop()
+
+
+-------------------------------app.py for querying records-------------------------------
+#!/usr/bin/env python3
+
+from flask import Flask, request, jsonify, Response
+import glob, json
+from collections import defaultdict, OrderedDict
+
+app = Flask(__name__)
+
+records = []
+for path in glob.glob("processed_data/part-*.json"):
+    with open(path, "r") as f:
+        for line in f:
+            rec = json.loads(line)
+            # Strip curly (‘ ’) and straight (" ') quotes around the term
+            rec["term"] = rec["term"].strip("‘’\"'")
+            records.append(rec)
+
+# Build lookup tables
+by_term = defaultdict(list)
+by_url  = defaultdict(list)
+for r in records:
+    by_term[r["term"]].append(r)
+    by_url[r["url"]].append(r)
+
+DOMAIN_PRIORITY = {".org": 0, ".edu": 1, ".com": 2}
+
+
+@app.route("/results", methods=["POST"])
+def results():
+    term = request.json.get("term", "")
+    agg = {}
+    for rec in by_term.get(term, []):
+        agg[rec["url"]] = agg.get(rec["url"], 0) + rec["clicks"]
+
+    def sort_key(item):
+        url, clicks = item
+        suffix = url[url.rfind("."):] if "." in url else ""
+        return (-clicks, DOMAIN_PRIORITY.get(suffix, 99))
+
+    sorted_items = sorted(agg.items(), key=sort_key)
+    ordered = OrderedDict(sorted_items)
+
+   
+    resp_body = json.dumps({"results": ordered}, separators=(',', ':'), ensure_ascii=False)
+    return Response(resp_body, mimetype="application/json")
+
+@app.route("/trends", methods=["POST"])
+def trends():
+    term = request.json.get("term", "")
+    total_clicks = sum(r["clicks"] for r in by_term.get(term, []))
+    return jsonify({"clicks": total_clicks})
+
+
+@app.route("/popularity", methods=["POST"])
+def popularity():
+    url = request.json.get("url", "")
+    total_clicks = sum(r["clicks"] for r in by_url.get(url, []))
+    return jsonify({"clicks": total_clicks})
+
+@app.route("/getBestTerms", methods=["POST"])
+def get_best_terms():
+    website = request.json.get("website", "")
+    recs = by_url.get(website, [])
+    total_clicks = sum(r["clicks"] for r in recs)
+    threshold = total_clicks * 0.05
+
+    clicks_per_term = defaultdict(int)
+    for r in recs:
+        clicks_per_term[r["term"]] += r["clicks"]
+
+    best_terms = [t for t, c in clicks_per_term.items() if c > threshold]
+    return jsonify({"best_terms": best_terms})
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
